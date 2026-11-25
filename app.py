@@ -1,0 +1,895 @@
+
+# ============================================================
+# MachinePulse AI
+# Industrial Machine Sound-Based Fault Detection
+# Deep Learning — CNN & Autoencoder
+# Complete Responsive Gradio Application
+# ============================================================
+
+
+import os
+import json
+import glob
+import numpy as np
+import librosa
+import librosa.display
+import gradio as gr
+import tensorflow as tf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+
+# ------------------------------------------------------------
+# 1. LOCATE LOCAL MODEL FILES
+# ------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = os.path.join(BASE_DIR, "saved_models")
+
+assert os.path.isdir(MODEL_DIR), (
+    f"Saved models folder not found: {MODEL_DIR}"
+)
+
+# ------------------------------------------------------------
+# 2. LOAD CNN MODEL
+# ------------------------------------------------------------
+
+model_files = (
+    glob.glob(os.path.join(MODEL_DIR, "*.keras"))
+    + glob.glob(os.path.join(MODEL_DIR, "*.h5"))
+)
+
+cnn_files = [
+    p for p in model_files
+    if "cnn" in os.path.basename(p).lower()
+]
+
+if len(cnn_files) != 1:
+    raise FileNotFoundError(
+        "Expected exactly one CNN model in saved_models. "
+        f"Found: {cnn_files}. Available models: {model_files}"
+    )
+
+cnn_model = tf.keras.models.load_model(
+    cnn_files[0],
+    compile=False
+)
+
+print("CNN loaded:", os.path.basename(cnn_files[0]))
+
+# ------------------------------------------------------------
+# 3. LOAD PREPROCESSING PARAMETERS
+# ------------------------------------------------------------
+
+config_path = os.path.join(
+    MODEL_DIR, "preprocessing_config.json"
+)
+
+with open(config_path, "r") as f:
+    config = json.load(f)
+
+print("Preprocessing configuration:", config)
+
+def get_setting(names, default):
+    for name in names:
+        if name in config:
+            return config[name]
+    return default
+
+SR = int(get_setting(["sr", "sample_rate"], 16000))
+DURATION = 10
+N_MELS = 128
+N_FFT = 1024
+HOP_LENGTH = 512
+
+train_mean = get_setting(["train_mean"], None)
+train_std = get_setting(["train_std"], None)
+
+if train_mean is None or train_std is None:
+    raise ValueError(
+        "Training normalization values are missing "
+        "from preprocessing_config.json"
+    )
+
+train_mean = float(train_mean)
+train_std = float(train_std)
+
+if train_std <= 0:
+    raise ValueError("Invalid training standard deviation")
+
+# ------------------------------------------------------------
+# 4. AUDIO FEATURE EXTRACTION
+# ------------------------------------------------------------
+
+def prepare_audio(file_path):
+    if not file_path:
+        raise gr.Error("Please upload a WAV audio file.")
+
+    if not file_path.lower().endswith(".wav"):
+        raise gr.Error("Only WAV audio files are supported.")
+
+    audio, sr = librosa.load(
+        file_path,
+        sr=SR,
+        duration=DURATION
+    )
+
+    target_length = SR * DURATION
+
+    if len(audio) < target_length:
+        audio = np.pad(
+            audio,
+            (0, target_length - len(audio))
+        )
+    else:
+        audio = audio[:target_length]
+
+    mel = librosa.feature.melspectrogram(
+        y=audio,
+        sr=sr,
+        n_mels=N_MELS,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH
+    )
+
+    mel_db = librosa.power_to_db(
+        mel,
+        ref=np.max
+    ).astype(np.float32)
+
+    normalized = (mel_db - train_mean) / train_std
+
+    expected_shape = tuple(
+        cnn_model.input_shape[1:3]
+    )
+
+    if normalized.shape != expected_shape:
+        raise gr.Error(
+            f"Unexpected spectrogram shape: "
+            f"{normalized.shape}. "
+            f"Expected: {expected_shape}"
+        )
+
+    features = normalized[np.newaxis, :, :, np.newaxis]
+
+    return audio, sr, mel_db, features
+
+# ------------------------------------------------------------
+# 5. PREDICTION
+# ------------------------------------------------------------
+
+def predict_machine_sound(audio_path):
+    audio, sr, mel_db, features = prepare_audio(audio_path)
+
+    probability = float(
+        cnn_model.predict(features, verbose=0)[0][0]
+    )
+
+    # Training labels: 0 = Normal, 1 = Abnormal
+    abnormal_probability = probability * 100
+    normal_probability = (1 - probability) * 100
+
+    if probability >= 0.5:
+        condition = "ABNORMAL — Unusual sound detected"
+        status_color = "#fb7185"
+    else:
+        condition = "NORMAL — Machine sound appears normal"
+        status_color = "#4ade80"
+
+    result_html = f"""
+    <div class="result-card">
+        <div class="small-label">MACHINE CONDITION</div>
+        <h2 style="color:{status_color};margin:10px 0;">
+            {condition}
+        </h2>
+        <p>
+            Prediction generated by the trained CNN model.
+        </p>
+    </div>
+    """
+
+    fig, axes = plt.subplots(
+        2, 1, figsize=(10, 6),
+        constrained_layout=True
+    )
+
+    time_axis = np.arange(len(audio)) / sr
+
+    axes[0].plot(
+        time_axis, audio,
+        color="#f97316",
+        linewidth=0.6
+    )
+    axes[0].set_title("Uploaded Machine Sound — Waveform")
+    axes[0].set_xlabel("Time (seconds)")
+    axes[0].set_ylabel("Amplitude")
+    axes[0].grid(alpha=0.2)
+
+    image = librosa.display.specshow(
+        mel_db,
+        sr=sr,
+        hop_length=HOP_LENGTH,
+        x_axis="time",
+        y_axis="mel",
+        ax=axes[1],
+        cmap="magma"
+    )
+
+    axes[1].set_title("Mel Spectrogram")
+    fig.colorbar(
+        image, ax=axes[1],
+        format="%+2.0f dB"
+    )
+
+    return (
+        result_html,
+        round(normal_probability, 2),
+        round(abnormal_probability, 2),
+        fig
+    )
+
+# ------------------------------------------------------------
+# 6. DATASET & MODEL STATISTICS
+# ------------------------------------------------------------
+
+TOTAL_FILES = 519
+NORMAL_FILES = 381
+ABNORMAL_FILES = 138
+
+CNN_ACCURACY = 96.15
+AE_ACCURACY = 78.21
+
+CNN_CORRECT = 75
+CNN_TEST = 78
+
+CNN_NORMAL_RECALL = 100
+CNN_ABNORMAL_RECALL = 85
+
+# ------------------------------------------------------------
+# 7. DASHBOARD CHARTS
+# ------------------------------------------------------------
+
+def dataset_chart():
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+
+    ax.barh(
+        ["Normal", "Abnormal"],
+        [NORMAL_FILES, ABNORMAL_FILES],
+        color=["#22c55e", "#f97316"]
+    )
+
+    ax.set_xlim(0, 450)
+    ax.set_xlabel("Number of recordings")
+    ax.set_title("Dataset Distribution")
+
+    for i, value in enumerate(
+        [NORMAL_FILES, ABNORMAL_FILES]
+    ):
+        ax.text(value + 7, i, str(value), va="center")
+
+    ax.invert_yaxis()
+    fig.tight_layout()
+
+    return fig
+
+
+def model_chart():
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+
+    models = ["CNN", "Autoencoder"]
+    accuracies = [CNN_ACCURACY, AE_ACCURACY]
+
+    bars = ax.bar(
+        models,
+        accuracies,
+        color=["#f97316", "#64748b"],
+        width=0.5
+    )
+
+    ax.set_ylim(0, 110)
+    ax.set_ylabel("Test Accuracy (%)")
+    ax.set_title("Model Performance Comparison")
+
+    for bar, value in zip(bars, accuracies):
+        ax.text(
+            bar.get_x() + bar.get_width()/2,
+            value + 2,
+            f"{value:.2f}%",
+            ha="center",
+            fontweight="bold"
+        )
+
+    fig.tight_layout()
+    return fig
+
+# ------------------------------------------------------------
+# 8. RESPONSIVE DESIGN
+# ------------------------------------------------------------
+
+CSS = """
+.gradio-container {
+    max-width: 1450px !important;
+    width: 100% !important;
+    margin: auto !important;
+    padding: clamp(12px, 3vw, 36px) !important;
+    background: #090f20 !important;
+    color: #f8fafc !important;
+}
+
+body {
+    background: #090f20 !important;
+}
+
+h1, h2, h3, p {
+    overflow-wrap: anywhere;
+}
+
+.hero {
+    background: linear-gradient(120deg,#182235,#292121);
+    border: 1px solid #58412f;
+    border-radius: 24px;
+    padding: clamp(28px, 6vw, 72px) 24px;
+    text-align: center;
+    box-sizing: border-box;
+}
+
+.hero h1 {
+    font-size: clamp(30px, 4vw, 60px);
+    color: #ff913e;
+    line-height: 1.2;
+    margin-bottom: 18px;
+}
+
+.hero h2 {
+    font-size: clamp(19px, 2.3vw, 30px);
+    color: white;
+    margin-bottom: 12px;
+}
+
+.hero p {
+    color: #d6dce8;
+    font-size: clamp(14px, 1.4vw, 18px);
+    line-height: 1.8;
+}
+
+.info-card, .result-card, .stat-card {
+    background: #172238;
+    border: 1px solid #304158;
+    border-radius: 16px;
+    padding: 22px;
+    height: 100%;
+    box-sizing: border-box;
+}
+
+.info-card h3 {
+    color: #fb923c;
+    margin-top: 0;
+}
+
+.info-card p {
+    color: #d1d9e6;
+    line-height: 1.7;
+}
+
+.stat-card h2 {
+    color: #fb923c;
+    font-size: clamp(26px, 3vw, 40px);
+    margin: 8px 0;
+}
+
+.stat-card p, .small-label {
+    color: #cbd5e1;
+    font-size: 14px;
+}
+
+.section-heading {
+    margin: 24px 0 14px;
+    color: #ffffff;
+}
+
+.orange-button {
+    background: #f97316 !important;
+    color: white !important;
+    border: none !important;
+    font-weight: bold !important;
+}
+
+.orange-button:hover {
+    background: #ea580c !important;
+}
+
+@media (max-width: 768px) {
+    .gradio-container {
+        padding: 12px !important;
+    }
+
+    .hero {
+        padding: 30px 16px;
+    }
+
+    .info-card, .stat-card {
+        padding: 16px;
+    }
+}
+"""
+
+def info_card(title, description):
+    return f"""
+    <div class="info-card">
+        <h3>{title}</h3>
+        <p>{description}</p>
+    </div>
+    """
+
+def stat_card(title, value, description):
+    return f"""
+    <div class="stat-card">
+        <p>{title}</p>
+        <h2>{value}</h2>
+        <p>{description}</p>
+    </div>
+    """
+
+# ------------------------------------------------------------
+# 9. BUILD COMPLETE APPLICATION
+# ------------------------------------------------------------
+
+with gr.Blocks(
+    title="MachinePulse AI",
+    theme=gr.themes.Base(
+        primary_hue="orange",
+        neutral_hue="slate"
+    ),
+    css=CSS
+) as demo:
+
+    gr.HTML("""
+    <div style="margin-bottom:22px;">
+        <h1 style="font-size:clamp(25px,3vw,38px);
+                   color:white;margin-bottom:8px;">
+            ⚡ MachinePulse AI
+        </h1>
+        <p style="color:#cbd5e1;font-weight:600;">
+            Intelligent Industrial Sound Monitoring
+        </p>
+    </div>
+    """)
+
+    # FIX: Give the main tabs a variable name
+    with gr.Tabs() as main_tabs:
+
+        # ====================================================
+        # PAGE 1 — WELCOME HUB
+        # ====================================================
+
+        with gr.Tab("Welcome Hub", id="home"):
+
+            gr.HTML("""
+            <div class="hero">
+                <h1>Welcome to MachinePulse AI</h1>
+
+                <h2>
+                    Industrial Machine Sound-Based
+                    Fault Detection
+                </h2>
+
+                <p style="color:#ffb477;font-weight:700;">
+                    Powered by Deep Learning —
+                    CNN &amp; Autoencoder
+                </p>
+
+                <p style="max-width:850px;margin:22px auto;">
+                    An AI-powered system that analyzes
+                    industrial machine sounds and identifies
+                    normal or abnormal operating conditions
+                    using Deep Learning.
+                </p>
+            </div>
+            """)
+
+            gr.Markdown("### Discover MachinePulse AI")
+
+            with gr.Row(equal_height=True):
+                gr.HTML(info_card(
+                    "🎧 Sound Intelligence Lab",
+                    "Upload industrial machine audio and "
+                    "receive AI-based operating condition "
+                    "predictions."
+                ))
+
+                gr.HTML(info_card(
+                    "📊 Insights Dashboard",
+                    "Explore dataset information, model "
+                    "performance, and overall project "
+                    "analysis."
+                ))
+
+                gr.HTML(info_card(
+                    "📘 Project Explorer",
+                    "Understand the project objectives, "
+                    "Deep Learning models, technologies, "
+                    "and methodology."
+                ))
+
+            start_button = gr.Button(
+                "Get Started — Analyze Machine Sound",
+                elem_classes=["orange-button"],
+                size="lg"
+            )
+
+        # ====================================================
+        # PAGE 2 — SOUND INTELLIGENCE LAB
+        # ====================================================
+
+        with gr.Tab(
+            "Sound Intelligence Lab",
+            id="lab"
+        ):
+
+            gr.Markdown("""
+            ## 🎧 Sound Intelligence Lab
+
+            Upload a machine sound recording to analyze
+            its operating condition using the trained CNN.
+
+            **Supported format:** WAV audio
+            """)
+
+            audio_input = gr.Audio(
+                label="Upload Machine Sound",
+                type="filepath",
+                sources=["upload"]
+            )
+
+            analyze_button = gr.Button(
+                "Analyze Machine Sound",
+                variant="primary",
+                elem_classes=["orange-button"]
+            )
+
+            condition_output = gr.HTML(
+                label="Machine Condition"
+            )
+
+            with gr.Row():
+                normal_output = gr.Number(
+                    label="Normal Probability (%)",
+                    precision=2
+                )
+
+                abnormal_output = gr.Number(
+                    label="Abnormal Probability (%)",
+                    precision=2
+                )
+
+            gr.Markdown("### Audio Signal Visualization")
+
+            audio_plot = gr.Plot(
+                label="Waveform & Mel Spectrogram"
+            )
+
+            analyze_button.click(
+                fn=predict_machine_sound,
+                inputs=audio_input,
+                outputs=[
+                    condition_output,
+                    normal_output,
+                    abnormal_output,
+                    audio_plot
+                ]
+            )
+
+            gr.Markdown("""
+            **Prediction Model:** Convolutional Neural
+            Network (CNN)
+
+            **Held-out Test Accuracy:** 96.15%
+
+            *This is an educational research system.
+            Predictions should not replace professional
+            machine inspection.*
+            """)
+
+        # ====================================================
+        # PAGE 3 — INSIGHTS DASHBOARD
+        # ====================================================
+
+        with gr.Tab(
+            "Insights Dashboard",
+            id="dashboard"
+        ):
+
+            gr.Markdown("""
+            ## 📊 MachinePulse AI — Project Insights
+
+            Explore the overall analysis of the project,
+            including dataset composition, Deep Learning
+            model performance, and fault detection results.
+
+            These statistics describe the evaluated dataset,
+            not the most recently uploaded audio.
+            """)
+
+            with gr.Row(equal_height=True):
+                gr.HTML(stat_card(
+                    "Total Machine Recordings",
+                    "519",
+                    "Normal and abnormal audio samples"
+                ))
+
+                gr.HTML(stat_card(
+                    "CNN Test Accuracy",
+                    "96.15%",
+                    "75 correct predictions out of 78"
+                ))
+
+                gr.HTML(stat_card(
+                    "Autoencoder Test Accuracy",
+                    "78.21%",
+                    "Experimental anomaly detection model"
+                ))
+
+            gr.Markdown("### Dataset Overview")
+
+            with gr.Row():
+                gr.HTML(info_card(
+                    "🟢 Normal Machine Sounds",
+                    "381 recordings representing normal "
+                    "machine operating conditions."
+                ))
+
+                gr.HTML(info_card(
+                    "🟠 Abnormal Machine Sounds",
+                    "138 recordings representing abnormal "
+                    "machine operating conditions."
+                ))
+
+            gr.Plot(
+                value=dataset_chart(),
+                label="Dataset Distribution"
+            )
+
+            gr.Markdown("### Deep Learning Model Performance")
+
+            gr.Plot(
+                value=model_chart(),
+                label="CNN vs Autoencoder"
+            )
+
+            with gr.Row(equal_height=True):
+                gr.HTML(info_card(
+                    "🧠 CNN — Primary Prediction Model",
+                    "The CNN achieved 96.15% test accuracy. "
+                    "It correctly identified all 58 normal "
+                    "recordings and 17 of 20 abnormal "
+                    "recordings in the test set."
+                ))
+
+                gr.HTML(info_card(
+                    "🔬 Autoencoder — Experimental Model",
+                    "The Autoencoder achieved 78.21% "
+                    "test accuracy. It learns normal sound "
+                    "patterns and uses reconstruction error "
+                    "to investigate unusual recordings. "
+                    "Its abnormal recall was 25% on the "
+                    "test set."
+                ))
+
+            gr.Markdown("### What Did the CNN Detect?")
+
+            with gr.Row(equal_height=True):
+                gr.HTML(stat_card(
+                    "Correct Predictions",
+                    "75 / 78",
+                    "Overall CNN test results"
+                ))
+
+                gr.HTML(stat_card(
+                    "Normal Sounds Detected",
+                    "58 / 58",
+                    "100% normal recall"
+                ))
+
+                gr.HTML(stat_card(
+                    "Abnormal Sounds Detected",
+                    "17 / 20",
+                    "85% abnormal recall"
+                ))
+
+            gr.HTML(info_card(
+                "💡 Key Project Finding",
+                "The CNN demonstrated stronger performance "
+                "than the Autoencoder on the held-out test "
+                "dataset. However, the CNN missed 3 of the "
+                "20 abnormal recordings, so predictions "
+                "should be treated as decision support "
+                "rather than guaranteed fault detection."
+            ))
+
+        # ====================================================
+        # PAGE 4 — PROJECT EXPLORER
+        # ====================================================
+
+        with gr.Tab(
+            "Project Explorer",
+            id="project"
+        ):
+
+            gr.Markdown("""
+            ## 📘 About MachinePulse AI
+
+            **Official Project Title:**
+
+            Industrial Machine Sound-Based Fault Detection
+            Using Deep Learning (CNN & Autoencoder)
+            """)
+
+            with gr.Row(equal_height=True):
+                gr.HTML(info_card(
+                    "🎯 Project Overview",
+                    "MachinePulse AI is a Deep Learning "
+                    "application designed to classify "
+                    "industrial machine sound recordings "
+                    "as normal or abnormal."
+                ))
+
+                gr.HTML(info_card(
+                    "⚙️ Problem Statement",
+                    "Industrial machines may develop faults "
+                    "that alter their operating sounds. "
+                    "Analyzing these changes can help "
+                    "identify recordings requiring further "
+                    "inspection."
+                ))
+
+            gr.Markdown("### Project Objectives")
+
+            with gr.Row(equal_height=True):
+                gr.HTML(info_card(
+                    "🎧 Audio Analysis",
+                    "Process industrial machine recordings "
+                    "and extract useful sound patterns."
+                ))
+
+                gr.HTML(info_card(
+                    "🧠 Sound Classification",
+                    "Use a CNN to distinguish normal and "
+                    "abnormal machine operating sounds."
+                ))
+
+                gr.HTML(info_card(
+                    "🔎 Anomaly Detection",
+                    "Explore Autoencoder-based anomaly "
+                    "detection using reconstruction error."
+                ))
+
+            gr.Markdown("### Dataset Information")
+
+            with gr.Row(equal_height=True):
+                gr.HTML(stat_card(
+                    "Dataset",
+                    "MIMII",
+                    "Industrial pump sound recordings"
+                ))
+
+                gr.HTML(stat_card(
+                    "Total Recordings",
+                    "519",
+                    "381 normal and 138 abnormal"
+                ))
+
+                gr.HTML(stat_card(
+                    "Audio Duration",
+                    "10 sec",
+                    "16,000 Hz sampling rate"
+                ))
+
+            gr.Markdown("### Deep Learning Models")
+
+            with gr.Row(equal_height=True):
+                gr.HTML(info_card(
+                    "🧠 Convolutional Neural Network",
+                    "Primary classification model. "
+                    "Processes Mel Spectrogram features "
+                    "to predict normal or abnormal machine "
+                    "conditions. Test accuracy: 96.15%."
+                ))
+
+                gr.HTML(info_card(
+                    "🔬 Autoencoder",
+                    "Experimental anomaly detection model. "
+                    "Learns to reconstruct normal machine "
+                    "sound features and measures "
+                    "reconstruction error. Test accuracy "
+                    "at the selected threshold: 78.21%."
+                ))
+
+            gr.Markdown("### Project Workflow")
+
+            gr.HTML("""
+            <div class="info-card" style="text-align:center;">
+                <h3>Industrial Audio Processing Pipeline</h3>
+                <p style="font-size:17px;">
+                    🎵 Audio Recording
+                    &nbsp; → &nbsp;
+                    ⚙️ Preprocessing
+                    &nbsp; → &nbsp;
+                    📈 Mel Spectrogram
+                    &nbsp; → &nbsp;
+                    🧠 CNN Prediction
+                    &nbsp; → &nbsp;
+                    ✅ Machine Condition
+                </p>
+            </div>
+            """)
+
+            gr.Markdown("### Technologies Used")
+
+            with gr.Row(equal_height=True):
+                gr.HTML(info_card(
+                    "🐍 Python & Google Colab",
+                    "Used for data processing, "
+                    "experimentation, and model development."
+                ))
+
+                gr.HTML(info_card(
+                    "🧠 TensorFlow / Keras",
+                    "Used to develop and train the CNN "
+                    "and Autoencoder architectures."
+                ))
+
+                gr.HTML(info_card(
+                    "🎼 Librosa",
+                    "Used for loading audio recordings "
+                    "and extracting Mel Spectrograms."
+                ))
+
+                gr.HTML(info_card(
+                    "🖥️ Gradio",
+                    "Used to build the interactive "
+                    "MachinePulse AI web application."
+                ))
+
+            gr.Markdown("""
+            ### Project Outcome
+
+            The CNN achieved **96.15% test accuracy**
+            on the held-out test set.
+
+            The Autoencoder was also evaluated as an
+            experimental anomaly detection approach,
+            but its abnormal detection performance
+            was weaker.
+
+            MachinePulse AI demonstrates how Deep Learning
+            can support industrial machine sound analysis.
+            """)
+
+    # ========================================================
+    # FIXED WELCOME PAGE NAVIGATION
+    # ========================================================
+
+    def open_sound_lab():
+        return gr.Tabs(selected="lab")
+
+    start_button.click(
+        fn=open_sound_lab,
+        inputs=[],
+        outputs=[main_tabs]
+    )
+
+    gr.Markdown("""
+    ---
+    **MachinePulse AI | Industrial Sound Intelligence**
+
+    Research and educational demonstration.
+    """)
+
+# ------------------------------------------------------------
+# 10. LAUNCH APPLICATION
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+    demo.launch(share=False)
